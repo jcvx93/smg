@@ -384,35 +384,24 @@ impl Engine {
     /// [`Format::validate`]). Definitions are written in the crate, so that is a programming
     /// error; a shape built at run time is checked before its table is.
     pub fn new(format: Format, declared: Declared) -> Self {
-        Self::shared(Arc::new(format), declared)
+        Self::shared(format.validated(), declared)
     }
 
     /// [`Self::new`] over a table other engines run too, the registry's
     /// ([`Table::shared`](crate::formats::Table::shared)) or one the caller keeps: the engine
     /// holds the one copy. The output's call ids count from a nonce drawn here, as in
-    /// [`Self::new`].
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::new`]: a table [`Format::validate`] refuses.
+    /// [`Self::new`]. A table checked where it was built to be shared (`Format::validated`,
+    /// the registry's) is not checked again; any other (one the caller keeps, a variant a
+    /// request asks for) is checked by the first engine that runs it, once, inside that
+    /// engine's isolation, and marked for the engines after it.
     pub fn shared(format: Arc<Format>, declared: Declared) -> Self {
         Self::with_call_ids(format, declared, CallIds::fresh())
     }
 
     /// [`Self::shared`], with the output's call ids counting from `ids` in place of a nonce drawn
     /// now: for a replay that wants them reproducible.
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::new`].
-    #[expect(
-        clippy::panic,
-        reason = "a table the crate wrote that fails its own check is a programming error"
-    )]
     pub fn with_call_ids(format: Arc<Format>, declared: Declared, ids: CallIds) -> Self {
-        if let Err(why) = format.validate() {
-            panic!("{why}");
-        }
+        format.check_once();
         let at_turn_start = format.start().is_some();
         let mut engine = Self {
             scanner: format.scanner(),
@@ -1530,6 +1519,17 @@ mod tests {
                 .then_some(at)
             })
             .collect()
+    }
+
+    /// A copy of a shared table is checked by its first engine, so what was
+    /// built on the copy cannot run unchecked: the mark stays with the share.
+    #[test]
+    #[should_panic(expected = "format plain: an empty turn anchor")]
+    fn an_engine_over_a_copy_of_a_shared_table_checks_what_was_built_on_it() {
+        let copy = (*crate::formats::Table::Plain.shared())
+            .clone()
+            .turn_anchor("");
+        let _ = Engine::new(copy, Declared::default());
     }
 
     #[test]
