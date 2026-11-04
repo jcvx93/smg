@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, responses::ResponsesRequest,
@@ -8,7 +6,7 @@ use openai_protocol::{
 use tonic::{transport::Channel, Request};
 use tracing::debug;
 
-use crate::BoxedTraceInjector;
+use crate::{request_fields::logit_bias_by_token_id, BoxedTraceInjector};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -306,7 +304,7 @@ impl MlxEngineClient {
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: request.ignore_eos,
             logprobs,
-            logit_bias: convert_logit_bias(request.logit_bias.as_ref()),
+            logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             seed: request.seed.and_then(|s| i32::try_from(s).ok()),
         }
     }
@@ -326,7 +324,7 @@ impl MlxEngineClient {
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: request.ignore_eos,
             logprobs,
-            logit_bias: convert_logit_bias(request.logit_bias.as_ref()),
+            logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             seed: request.seed.and_then(|s| i32::try_from(s).ok()),
         }
     }
@@ -411,17 +409,6 @@ impl MlxEngineClient {
             logprobs: request.top_logprobs.map(|v| v as i32),
             seed: None,
         }
-    }
-}
-
-/// Convert OpenAI-style logit_bias (String keys) to proto logit_bias (i32 keys).
-fn convert_logit_bias(bias: Option<&HashMap<String, f32>>) -> HashMap<i32, f32> {
-    match bias {
-        Some(map) => map
-            .iter()
-            .filter_map(|(k, v)| k.parse::<i32>().ok().map(|id| (id, *v)))
-            .collect(),
-        None => HashMap::new(),
     }
 }
 
