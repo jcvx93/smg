@@ -358,8 +358,9 @@ fn engine(table: Table, prompt: &str, declared: &Declared) -> Engine {
     engine
 }
 
-/// Feeds `pieces` and the end of the stream; the events drained after every piece, as a stream's
-/// reader drains them.
+/// Feeds `pieces` and the end of the stream; the events consumed out of `out` after every piece,
+/// as a stream's reader consumes them, the buffer's storage kept (a vector per delta would be the
+/// bench's own allocation, not the engine's).
 fn read<'d>(engine: &mut Engine, pieces: &[&'d str], out: &mut Events<'d>) {
     for piece in pieces {
         engine
@@ -372,7 +373,9 @@ fn read<'d>(engine: &mut Engine, pieces: &[&'d str], out: &mut Events<'d>) {
                 out,
             )
             .expect("delta");
-        black_box(out.drain());
+        out.consume().for_each(|event| {
+            black_box(event);
+        });
     }
     engine
         .feed(
@@ -382,7 +385,9 @@ fn read<'d>(engine: &mut Engine, pieces: &[&'d str], out: &mut Events<'d>) {
             out,
         )
         .expect("end");
-    black_box(out.drain());
+    out.consume().for_each(|event| {
+        black_box(event);
+    });
 }
 
 fn parse(c: &mut Criterion) {
@@ -392,23 +397,19 @@ fn parse(c: &mut Criterion) {
         let name = subject.table.name();
         group.throughput(Throughput::Bytes(subject.output.len() as u64));
         group.bench_with_input(BenchmarkId::new("whole", name), subject, |b, subject| {
+            let mut out = Events::new();
             b.iter_batched_ref(
                 || engine(subject.table, subject.prompt, &declared),
-                |engine| {
-                    let mut out = Events::new();
-                    read(engine, &[subject.output], &mut out);
-                },
+                |engine| read(engine, &[subject.output], &mut out),
                 BatchSize::SmallInput,
             );
         });
         let cut = pieces(subject.output, 8);
         group.bench_with_input(BenchmarkId::new("pieces8", name), subject, |b, subject| {
+            let mut out = Events::new();
             b.iter_batched_ref(
                 || engine(subject.table, subject.prompt, &declared),
-                |engine| {
-                    let mut out = Events::new();
-                    read(engine, &cut, &mut out);
-                },
+                |engine| read(engine, &cut, &mut out),
                 BatchSize::SmallInput,
             );
         });
@@ -431,22 +432,18 @@ fn prose_only(c: &mut Criterion) {
     for (table, prompt) in subjects {
         let name = table.name();
         group.bench_with_input(BenchmarkId::new("whole", name), &table, |b, table| {
+            let mut out = Events::new();
             b.iter_batched_ref(
                 || engine(*table, prompt, &declared),
-                |engine| {
-                    let mut out = Events::new();
-                    read(engine, &[text.as_str()], &mut out);
-                },
+                |engine| read(engine, &[text.as_str()], &mut out),
                 BatchSize::SmallInput,
             );
         });
         group.bench_with_input(BenchmarkId::new("pieces8", name), &table, |b, table| {
+            let mut out = Events::new();
             b.iter_batched_ref(
                 || engine(*table, prompt, &declared),
-                |engine| {
-                    let mut out = Events::new();
-                    read(engine, &cut, &mut out);
-                },
+                |engine| read(engine, &cut, &mut out),
                 BatchSize::SmallInput,
             );
         });
@@ -503,33 +500,27 @@ fn slices(c: &mut Criterion) {
             // The engine is built outside the timing: a slice is short, and its row is the
             // reading alone; `setup/engine` states the per-request setup on its own.
             group.bench_with_input(BenchmarkId::new("whole", name), slice, |b, slice| {
+                let mut out = Events::new();
                 b.iter_batched_ref(
                     || engine(*table, &slice.prompt, &declared),
-                    |engine| {
-                        let mut out = Events::new();
-                        read(engine, &[slice.output.as_str()], &mut out);
-                    },
+                    |engine| read(engine, &[slice.output.as_str()], &mut out),
                     BatchSize::SmallInput,
                 );
             });
             group.bench_with_input(BenchmarkId::new("chars", name), slice, |b, slice| {
+                let mut out = Events::new();
                 b.iter_batched_ref(
                     || engine(*table, &slice.prompt, &declared),
-                    |engine| {
-                        let mut out = Events::new();
-                        read(engine, &by_char, &mut out);
-                    },
+                    |engine| read(engine, &by_char, &mut out),
                     BatchSize::SmallInput,
                 );
             });
             group.throughput(Throughput::Elements(by_token.len() as u64));
             group.bench_with_input(BenchmarkId::new("tokens", name), slice, |b, slice| {
+                let mut out = Events::new();
                 b.iter_batched_ref(
                     || engine(*table, &slice.prompt, &declared),
-                    |engine| {
-                        let mut out = Events::new();
-                        read(engine, &by_token, &mut out);
-                    },
+                    |engine| read(engine, &by_token, &mut out),
                     BatchSize::SmallInput,
                 );
             });
