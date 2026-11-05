@@ -522,6 +522,12 @@ pub struct LoadSnapshot {
     pub max_running_requests: i32,
     pub token_usage: f64,
     pub gen_throughput: f64,
+    /// Computed prompt tokens per second over the recent prefill passes
+    /// (the timing model's prefill cost per pass); `None` before the first
+    /// pass that prefilled anything and again once the last one is
+    /// [`PREFILL_RATE_TTL`] old, as the servicers' trackers report it (they
+    /// want two samples within the minute, the mock reports from its first).
+    pub prefill_throughput: Option<f64>,
     pub cache_hit_rate: f64,
     /// Cached blocks (referenced or idle) in the KV pool.
     pub num_cached_blocks: i32,
@@ -735,6 +741,11 @@ fn records() -> &'static Mutex<(u64, VecDeque<RequestRecord>)> {
 }
 
 const RECORD_CAPACITY: usize = 500_000;
+
+/// How long the last prefill pass keeps the snapshot's measured input
+/// capacity: the servicers' load trackers drop their samples after a minute,
+/// and a worker idle that long is priced by the fallback again.
+const PREFILL_RATE_TTL: Duration = Duration::from_secs(60);
 
 /// All engines registered in this process.
 pub(crate) fn fleet_engines() -> Vec<Engine> {
@@ -1597,6 +1608,9 @@ struct SchedulerState {
     kv_seq: u64,
     kv_event_id: u64,
     gen_tp_ewma: f64,
+    /// Computed prompt tokens per second of the recent prefill passes and
+    /// when the last of them ran; `None` until a pass prefilled anything.
+    prefill_tp: Option<(Instant, f64)>,
     cache_hit_ewma: f64,
     preemptions: u64,
     /// A reset was requested; the next pass clears the cache and says so.
@@ -1644,6 +1658,7 @@ impl SchedulerState {
             kv_seq: 0,
             kv_event_id: 0,
             gen_tp_ewma: 0.0,
+            prefill_tp: None,
             cache_hit_ewma: 0.0,
             preemptions: 0,
             reset_pending: false,
@@ -1757,6 +1772,14 @@ impl SchedulerState {
         self.running.iter().map(|r| u64::from(r.seq_len())).sum()
     }
 
+    /// The measured input capacity while the last prefill pass is within
+    /// [`PREFILL_RATE_TTL`]: `None` before the first and after a minute idle,
+    /// as the servicers' trackers report it once their samples expired.
+    fn prefill_throughput(&self) -> Option<f64> {
+        let (at, rate) = self.prefill_tp?;
+        (at.elapsed() <= PREFILL_RATE_TTL).then_some(rate)
+    }
+
     fn snapshot(&self, p: &EngineParams) -> LoadSnapshot {
         let used = self.active_tokens();
         let waiting_uncached: i64 = self
@@ -1773,6 +1796,7 @@ impl SchedulerState {
             max_running_requests: p.max_running.min(i32::MAX as usize) as i32,
             token_usage: (used as f64 / p.kv_capacity_tokens.max(1) as f64).clamp(0.0, 1.0),
             gen_throughput: self.gen_tp_ewma,
+            prefill_throughput: self.prefill_throughput(),
             cache_hit_rate: self.cache_hit_ewma,
             num_cached_blocks: self.pool.cached().min(i32::MAX as usize) as i32,
             num_preemptions: self.preemptions.min(i64::MAX as u64) as i64,
@@ -2078,6 +2102,18 @@ impl SchedulerState {
             0.0
         };
         self.gen_tp_ewma = ewma(self.gen_tp_ewma, throughput_sample, 0.3);
+        // The pass's prefill rate: what it computed over what the timing
+        // model charged for it (a pass that prefilled nothing is no sample);
+        // an expired rate is gone, as the trackers' samples are, and the new
+        // sample starts over.
+        if prefill_tokens > 0 && prefill_ms > 0.0 {
+            let sample = f64::from(prefill_tokens) / (prefill_ms / 1000.0);
+            let rate = match self.prefill_throughput() {
+                Some(prev) => ewma(prev, sample, 0.3),
+                None => sample,
+            };
+            self.prefill_tp = Some((Instant::now(), rate));
+        }
 
         let batch = if kv.is_empty() {
             None
@@ -2390,6 +2426,7 @@ impl LoadSnapshot {
             max_running_requests: p.max_running.min(i32::MAX as usize) as i32,
             token_usage: 0.0,
             gen_throughput: 0.0,
+            prefill_throughput: None,
             cache_hit_rate: 0.0,
             num_cached_blocks: 0,
             num_preemptions: 0,
@@ -2561,6 +2598,50 @@ mod tests {
         assert_ne!(
             cold, different,
             "the partial tail participates in output identity"
+        );
+    }
+
+    /// The snapshot's prefill rate: none before any pass prefilled, then
+    /// the computed tokens over the timing model's cost of the pass (what a
+    /// servicer measures of its engine), unmoved by a pass that decodes
+    /// alone, gone once the last prefill pass is a minute old, and started
+    /// over (not averaged with the stale figure) by the next.
+    #[test]
+    fn the_snapshot_reports_the_prefill_rate_of_the_passes_it_ran() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        assert_eq!(st.snapshot(&p).prefill_throughput, None, "no pass yet");
+        let (r, _rx) = req("prefill", vec![7; 256], 4);
+        st.enqueue(r, &p);
+        st.step(&p);
+        let rate = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("one pass prefilled");
+        let expected = 256.0 / (p.timing.prefill_pass_ms(256, 256) / 1000.0);
+        assert!((rate - expected).abs() < 1e-6, "{rate} vs {expected}");
+        st.step(&p);
+        assert_eq!(
+            st.snapshot(&p).prefill_throughput,
+            Some(rate),
+            "a decode-only pass is no prefill sample"
+        );
+        let stale = Instant::now()
+            .checked_sub(PREFILL_RATE_TTL + Duration::from_secs(1))
+            .expect("a clock older than the ttl");
+        st.prefill_tp = st.prefill_tp.map(|(_, rate)| (stale, rate));
+        assert_eq!(st.snapshot(&p).prefill_throughput, None, "a minute idle");
+        let (r, _rx) = req("again", vec![9; 128], 4);
+        st.enqueue(r, &p);
+        st.step(&p);
+        let restarted = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("the next pass that prefilled");
+        let expected = 128.0 / (p.timing.prefill_pass_ms(128, 128) / 1000.0);
+        assert!(
+            (restarted - expected).abs() < 1e-6,
+            "{restarted} vs {expected}: not averaged with the stale rate"
         );
     }
 
@@ -3206,6 +3287,7 @@ mod tests {
             max_running_requests: 128,
             token_usage: 0.59,
             gen_throughput: 3_000.0,
+            prefill_throughput: Some(20_000.0),
             cache_hit_rate: 0.4,
             num_cached_blocks: 42_000,
             num_preemptions: 0,
@@ -3225,6 +3307,11 @@ mod tests {
             "no queued token-work or used-token count"
         );
         assert_eq!((v.gen_throughput, v.cache_hit_rate), (0.0, 0.0));
+        assert_eq!(
+            v.prefill_throughput,
+            Some(20_000.0),
+            "the measured prefill capacity is reported on every shape"
+        );
         assert_eq!("vllm".parse::<LoadsLike>(), Ok(LoadsLike::Vllm));
         assert!("other".parse::<LoadsLike>().is_err());
     }
