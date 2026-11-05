@@ -29,12 +29,14 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
+use std::borrow::Cow;
+
 use super::object::{Mode, Object};
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     tagged::{
-        end_cut_call, held_text, refuse,
+        end_cut_call, held_text, refuse, take_owned,
         value::{cut as cut_json, cut_opens_a_string, json, json_prefix, Kind},
     },
     Declared,
@@ -202,6 +204,9 @@ pub struct Assembler {
     /// The function's name once `ToolCallStart` was pushed.
     function: Option<String>,
     done: bool,
+    /// The buffer the events of a piece the scanner held fill before they go out owned
+    /// (`take_owned`): kept between pieces with its room.
+    scratch: Events<'static>,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +249,7 @@ impl Assembler {
             stage: Stage::Name,
             function: None,
             done: false,
+            scratch: Events::new(),
         }
     }
 
@@ -254,12 +260,12 @@ impl Assembler {
 
     /// Append the next bytes of the call and push the events they complete. Every byte is the
     /// call's until the engine says otherwise, so this takes them all.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
         if self.done {
             return;
         }
         let scanned = self.scanner.feed(bytes);
-        for piece in scanned.pieces() {
+        for piece in scanned.pieces_of_delta() {
             self.take(piece, declared, out);
         }
         self.scanner.reclaim(scanned);
@@ -348,7 +354,8 @@ impl Assembler {
                         self.object.push_fragment(opening, source, out);
                     }
                     Mode::Streaming { .. } => {
-                        self.object.value_bytes(&key, start, &mut mode, &tail, out);
+                        self.object
+                            .value_bytes(&key, start, &mut mode, Cow::Owned(tail), out);
                     }
                     Mode::Whole | Mode::Undecided => {
                         let text = held_text(&self.object.carried, start, None);
@@ -449,16 +456,22 @@ impl Assembler {
             return false;
         }
         let held = self.scanner.set_aside();
-        self.value_text(&held, out);
+        self.value_text(Cow::Owned(held), out);
         super::left_open(why, out);
         self.object.close_member("\"".to_string(), "", out);
         self.stage = Stage::Between;
         true
     }
 
-    fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
+    fn take<'d>(&mut self, piece: Piece<'d>, declared: &Declared, out: &mut Events<'d>) {
         match piece {
-            Piece::Text(text) => self.text(&text, out),
+            Piece::Text(Cow::Borrowed(text)) => self.text(text, out),
+            // The join's part after a hold is a copy, nobody's delta: its events go out owned.
+            Piece::Text(Cow::Owned(text)) => {
+                let mut scratch = std::mem::take(&mut self.scratch);
+                take_owned(&text, &mut scratch, out, |text, out| self.text(text, out));
+                self.scratch = scratch;
+            }
             Piece::Marker(tag) => self.tag(tag, declared, out),
         }
     }
@@ -521,11 +534,11 @@ impl Assembler {
         }
     }
 
-    fn text(&mut self, text: &str, out: &mut Events) {
+    fn text<'d>(&mut self, text: &'d str, out: &mut Events<'d>) {
         match &self.stage {
             Stage::Name | Stage::Key { .. } => self.object.carried.push_str(text),
             Stage::Between | Stage::Keyed { .. } => self.text_between(text, out),
-            Stage::Value(_) => self.value_text(text, out),
+            Stage::Value(_) => self.value_text(Cow::Borrowed(text), out),
         }
     }
 
@@ -588,7 +601,7 @@ impl Assembler {
         });
     }
 
-    fn value_text(&mut self, text: &str, out: &mut Events) {
+    fn value_text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
@@ -667,11 +680,11 @@ mod tests {
     }
 
     /// The events of one block fed in `pieces`, closed by the call's marker or cut.
-    fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
+    fn run<'p>(pieces: &[&'p str], cut: bool) -> Vec<Event<'p>> {
         let mut assembler = Assembler::new(0, "call_0", Tags::PLAIN);
         let mut out = Events::new();
         let declared = declared();
-        for piece in pieces {
+        for &piece in pieces {
             assembler.feed(piece, &declared, &mut out);
         }
         if cut {

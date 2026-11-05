@@ -21,11 +21,13 @@
 //!
 //! [`formats::minimax_m3`]: crate::formats::minimax_m3()
 
+use std::borrow::Cow;
+
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     json::{PartialJson, PartialJsonError},
     tagged::{
-        assembler::{push_escaped, push_quoted},
+        assembler::{escaped, push_escaped, push_quoted},
         end_cut_call,
         value::{json, Kind, ITEM, NULL_WORDS},
     },
@@ -165,7 +167,7 @@ impl Assembler {
 
     /// Append the next bytes of the call and push the events they complete. Every byte is the
     /// call's until the engine says otherwise, so this takes them all.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
         if self.done {
             return;
         }
@@ -305,7 +307,7 @@ impl Assembler {
         }
         let held = std::mem::take(&mut self.carried);
         if !held.is_empty() {
-            self.leaf_text(&held, out);
+            self.leaf_text(Cow::Owned(held), out);
         }
         super::left_open(why, out);
         self.open.pop();
@@ -315,7 +317,7 @@ impl Assembler {
     }
 
     /// Reads as much of `text` as one step takes and returns the rest.
-    fn take<'a>(&mut self, text: &'a str, declared: &Declared, out: &mut Events) -> &'a str {
+    fn take<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> &'d str {
         if self.refused {
             // Nesting past the bound: the rest of the call is held for the report at its end.
             self.carried.push_str(text);
@@ -380,7 +382,7 @@ impl Assembler {
 
     /// The elements: a tag being read takes its bytes up to `>`, or stops being a tag at the first
     /// byte a name cannot hold; text runs to the next `<`.
-    fn body<'a>(&mut self, text: &'a str, declared: &Declared, out: &mut Events) -> &'a str {
+    fn body<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> &'d str {
         if let Some(tag) = &mut self.tag {
             let Some((at, byte)) = text.char_indices().find(|(_, c)| !is_tag_byte(*c)) else {
                 tag.push_str(text);
@@ -400,13 +402,13 @@ impl Assembler {
         match text.find('<') {
             Some(at) => {
                 if at > 0 {
-                    self.text(&text[..at], declared, out);
+                    self.text(Cow::Borrowed(&text[..at]), declared, out);
                 }
                 self.tag = Some(String::new());
                 &text[at + 1..]
             }
             None => {
-                self.text(text, declared, out);
+                self.text(Cow::Borrowed(text), declared, out);
                 ""
             }
         }
@@ -415,8 +417,7 @@ impl Assembler {
     /// A `<` and the bytes after it were not a tag: they are text where they stand.
     fn release_tag(&mut self, declared: &Declared, out: &mut Events) {
         if let Some(tag) = self.tag.take() {
-            let text = format!("<{tag}");
-            self.text(&text, declared, out);
+            self.text(Cow::Owned(format!("<{tag}")), declared, out);
         }
     }
 
@@ -436,7 +437,7 @@ impl Assembler {
             None => (false, tag),
         };
         if name.is_empty() || name.contains('/') {
-            self.text(&bytes, declared, out);
+            self.text(Cow::Owned(bytes), declared, out);
             return;
         }
         if !self.started() {
@@ -444,9 +445,9 @@ impl Assembler {
             return;
         }
         if closing {
-            self.close_tag(name, &bytes, declared, out);
+            self.close_tag(name, bytes, declared, out);
         } else {
-            self.open_tag(name, &bytes, declared, out);
+            self.open_tag(name, bytes, declared, out);
         }
         self.after_separator = false;
     }
@@ -461,10 +462,10 @@ impl Assembler {
     /// nesting, so the fragments stop where they are still a prefix it takes, as the JSON syntax
     /// stops at the bracket it cannot take; nothing of the element's member is written, so the
     /// containers above it close whole at the end without it.
-    fn open_tag(&mut self, key: &str, bytes: &str, declared: &Declared, out: &mut Events) {
+    fn open_tag(&mut self, key: &str, bytes: String, declared: &Declared, out: &mut Events) {
         match self.open.last().map(|element| element.shape) {
             Some(Shape::Leaf(_)) => {
-                self.leaf_text(bytes, out);
+                self.leaf_text(Cow::Owned(bytes), out);
                 return;
             }
             Some(Shape::Open) => {
@@ -475,11 +476,11 @@ impl Assembler {
                 };
                 if leaf {
                     self.become_leaf(declared, out);
-                    self.leaf_text(bytes, out);
+                    self.leaf_text(Cow::Owned(bytes), out);
                     return;
                 }
                 if self.open.len() >= DEEPEST {
-                    self.carried.push_str(bytes);
+                    self.carried.push_str(&bytes);
                     self.value.clear();
                     self.refused = true;
                     return;
@@ -488,7 +489,7 @@ impl Assembler {
             }
             Some(Shape::Object | Shape::List) | None => {}
         }
-        self.carried.push_str(bytes);
+        self.carried.push_str(&bytes);
         self.value.clear();
         self.open.push(Element {
             key: key.to_string(),
@@ -500,14 +501,14 @@ impl Assembler {
 
     /// A closing tag: it closes the innermost element when it names it; inside a leaf, or under
     /// an element with no child yet, any other closing tag is text; elsewhere it is refused.
-    fn close_tag(&mut self, name: &str, bytes: &str, declared: &Declared, out: &mut Events) {
+    fn close_tag(&mut self, name: &str, bytes: String, declared: &Declared, out: &mut Events) {
         match self.open.last() {
-            Some(element) if element.key == name => self.close_element(bytes, declared, out),
+            Some(element) if element.key == name => self.close_element(&bytes, declared, out),
             Some(Element {
                 shape: Shape::Leaf(_) | Shape::Open,
                 ..
-            }) => self.text(bytes, declared, out),
-            Some(_) | None => self.refuse_between(bytes, MalformedReason::TagOutOfPlace, out),
+            }) => self.text(Cow::Owned(bytes), declared, out),
+            Some(_) | None => self.refuse_between(&bytes, MalformedReason::TagOutOfPlace, out),
         }
     }
 
@@ -560,20 +561,23 @@ impl Assembler {
         fragment
     }
 
-    fn text(&mut self, text: &str, declared: &Declared, out: &mut Events) {
+    /// Text where it stands: the delta's (`Cow::Borrowed`, which a streamed leaf's fragment
+    /// keeps) or the assembler's own (`Cow::Owned`: a tag that turned out to be text, bytes it
+    /// held).
+    fn text<'d>(&mut self, text: Cow<'d, str>, declared: &Declared, out: &mut Events<'d>) {
         self.after_separator = false;
         match self.open.last().map(|element| element.shape) {
             Some(Shape::Leaf(_)) => self.leaf_text(text, out),
             Some(Shape::Open) => {
                 // The element's first text: whitespace alone is held, since a child tag may still
                 // follow; anything else makes the element a leaf, the whitespace part of it.
-                self.value.push_str(text);
-                self.carried.push_str(text);
+                self.value.push_str(&text);
+                self.carried.push_str(&text);
                 if !self.value.trim().is_empty() {
                     self.become_leaf(declared, out);
                 }
             }
-            Some(Shape::Object | Shape::List) | None => self.text_between(text, out),
+            Some(Shape::Object | Shape::List) | None => self.text_between(&text, out),
         }
     }
 
@@ -650,7 +654,7 @@ impl Assembler {
         }
     }
 
-    fn leaf_text(&mut self, text: &str, out: &mut Events) {
+    fn leaf_text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let Some(Element {
             shape: Shape::Leaf(leaf),
             ..
@@ -660,20 +664,32 @@ impl Assembler {
         };
         match leaf.mode {
             Mode::Whole => {
-                self.value.push_str(text);
-                self.carried.push_str(text);
+                self.value.push_str(&text);
+                self.carried.push_str(&text);
             }
             Mode::Undecided => {
-                self.value.push_str(text);
-                self.carried.push_str(text);
+                self.value.push_str(&text);
+                self.carried.push_str(&text);
                 self.decide_null(out);
             }
+            // A piece of the delta with nothing carried before it reaches its fragment
+            // borrowed, text and source alike, as the JSON syntax's fragments do (the text
+            // escaped into a copy where a character needs it); one after carried bytes, or
+            // the assembler's own, is written with them as its own.
             Mode::Streaming => {
-                let mut json = String::with_capacity(text.len());
-                push_escaped(&mut json, text);
-                let mut source = std::mem::take(&mut self.carried);
-                source.push_str(text);
-                self.push_fragment(json, Text::uncounted(source), out);
+                let (json, source) = match text {
+                    Cow::Borrowed(text) if self.carried.is_empty() => {
+                        (escaped(text), Text::uncounted(text))
+                    }
+                    text => {
+                        let mut json = String::with_capacity(text.len());
+                        push_escaped(&mut json, &text);
+                        let mut source = std::mem::take(&mut self.carried);
+                        source.push_str(&text);
+                        (Cow::Owned(json), Text::uncounted(source))
+                    }
+                };
+                self.push_fragment(json, source, out);
             }
         }
     }
@@ -793,7 +809,12 @@ impl Assembler {
         self.push_fragment(json, source, out);
     }
 
-    fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
+    fn push_fragment<'d>(
+        &self,
+        json: impl Into<Cow<'d, str>>,
+        source: Text<'d>,
+        out: &mut Events<'d>,
+    ) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: json.into(),
