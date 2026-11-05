@@ -437,17 +437,18 @@ impl PolicyRegistry {
             result
         };
 
-        let healthy = get_healthy_worker_indices(workers, info);
-        if healthy.is_empty() {
-            return finish(None, ExecutionBranch::NoHealthyWorkers);
-        }
         let delegate = sticky.assignment_mode() == ManualAssignmentMode::Delegate;
 
-        let pin = sticky.peek_pin(workers, key, &healthy);
+        // A hit reads the pin's candidates alone; the eligible list is built
+        // only where a worker has to be chosen from it.
+        let pin = sticky.peek_pin(workers, key, |idx| {
+            info.admits(workers[idx].routing_state())
+        });
         if let PinState::Pinned(idx) = pin {
             if !over_cap(idx) {
                 return finish(Some(idx), ExecutionBranch::OccupiedHit);
             }
+            let healthy = get_healthy_worker_indices(workers, info);
             // Over the cap: reassign, but re-pin only on a strict improvement.
             // Re-picking the pinned worker (a prefix-affine policy often will)
             // or another saturated worker keeps the pin, so fleet-wide
@@ -464,6 +465,11 @@ impl PolicyRegistry {
                 sticky.pin_front(key, workers[new_idx].url());
             }
             return finish(Some(new_idx), ExecutionBranch::CapRespill);
+        }
+
+        let healthy = get_healthy_worker_indices(workers, info);
+        if healthy.is_empty() {
+            return finish(None, ExecutionBranch::NoHealthyWorkers);
         }
 
         if delegate {
