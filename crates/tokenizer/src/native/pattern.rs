@@ -32,6 +32,9 @@ pub(super) struct Class {
     negated: bool,
     categories: u16,
     ranges: Vec<(u32, u32)>,
+    /// Categories taken out of the class before any negation: the engine's
+    /// intersection with a negated property class, `[...&&[^\p{Han}]]`.
+    without: u16,
     /// Membership of U+0000..=U+007F, resolved once.
     ascii: AsciiSet,
 }
@@ -90,6 +93,10 @@ const CAT_TITLECASE: u16 = 1 << 7;
 const CAT_MODIFIER_LETTER: u16 = 1 << 8;
 const CAT_OTHER_LETTER: u16 = 1 << 9;
 const CAT_SPACE: u16 = 1 << 10;
+/// The `Han` script: the one script property the patterns use (a template
+/// cuts ideograph runs out before its letter classes and takes them out of
+/// those classes).
+const CAT_HAN: u16 = 1 << 11;
 
 /// Pairs of ASCII letters that are the full case folding of one character
 /// (ß ẞ: ss; ﬀ: ff; ﬁ: fi; ﬂ: fl; ﬃ ﬄ: ffi, ffl; ﬅ ﬆ: st), which the engine
@@ -97,7 +104,7 @@ const CAT_SPACE: u16 = 1 << 10;
 const MULTI_CHARACTER_FOLDS: [[char; 2]; 5] =
     [['s', 's'], ['s', 't'], ['f', 'f'], ['f', 'i'], ['f', 'l']];
 
-const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
+const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
     (CAT_NUMBER, unicode::NUMBER),
@@ -109,12 +116,20 @@ const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
     (CAT_MODIFIER_LETTER, unicode::MODIFIER_LETTER),
     (CAT_OTHER_LETTER, unicode::OTHER_LETTER),
     (CAT_SPACE, unicode::SPACE),
+    (CAT_HAN, unicode::HAN),
 ];
 
 #[inline]
 fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
     let index = ranges.partition_point(|&(_, end)| end < code);
     ranges.get(index).is_some_and(|&(start, _)| start <= code)
+}
+
+/// Whether `code` is in the table of any category of `categories`.
+fn in_categories(categories: u16, code: u32) -> bool {
+    CATEGORY_TABLES
+        .iter()
+        .any(|&(bit, table)| categories & bit != 0 && in_ranges(table, code))
 }
 
 impl Class {
@@ -132,9 +147,10 @@ impl Class {
     fn contains_slow(&self, code: u32) -> bool {
         let mut hit = in_ranges(&self.ranges, code);
         if !hit && self.categories != 0 {
-            hit = CATEGORY_TABLES
-                .iter()
-                .any(|&(bit, table)| self.categories & bit != 0 && in_ranges(table, code));
+            hit = in_categories(self.categories, code);
+        }
+        if hit && self.without != 0 {
+            hit = !in_categories(self.without, code);
         }
         hit != self.negated
     }
@@ -1305,8 +1321,25 @@ impl Parser<'_> {
             "Lt" => CAT_TITLECASE,
             "Lm" => CAT_MODIFIER_LETTER,
             "Lo" => CAT_OTHER_LETTER,
+            "Han" => CAT_HAN,
             _ => return None,
         })
+    }
+
+    /// `[^\p{X}...]` after `&&` inside a class: the properties it takes out
+    /// of the class. Nothing else may stand on either side of the `&&`.
+    fn parse_subtracted_properties(&mut self) -> Option<u16> {
+        if self.chars.next()? != '[' || self.chars.next()? != '^' {
+            return None;
+        }
+        let mut categories = 0;
+        loop {
+            match self.chars.next()? {
+                ']' if categories != 0 => return Some(categories),
+                '\\' if self.chars.next()? == 'p' => categories |= self.parse_property()?,
+                _ => return None,
+            }
+        }
     }
 
     /// The body of `[...]`, after the opening bracket.
@@ -1335,9 +1368,18 @@ impl Parser<'_> {
                     'P' | 'S' | 'd' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
                     other => escaped_literal(other)?,
                 },
-                // Nested classes, intersections and POSIX brackets are not supported.
+                // An intersection with a negated property class closes the
+                // class: `[...&&[^\p{Han}]]`. Nested classes, other
+                // intersections and POSIX brackets are not supported.
+                '&' if !first && self.chars.peek() == Some(&'&') => {
+                    self.chars.next();
+                    class.without = self.parse_subtracted_properties()?;
+                    if self.chars.next()? != ']' {
+                        return None;
+                    }
+                    break;
+                }
                 '[' => return None,
-                '&' if self.chars.peek() == Some(&'&') => return None,
                 literal => literal,
             };
             first = false;
@@ -1415,8 +1457,12 @@ mod tests {
     const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 10] = [
-        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED,
+    /// The Kimi template: ideograph runs first, the cased letter runs
+    /// without the ideographs, the rest as cl100k's.
+    const KIMI: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    const PATTERNS: [&str; 11] = [
+        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED, KIMI,
     ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
@@ -1518,6 +1564,12 @@ mod tests {
         '中',
         '文',
         '龥',
+        '々',
+        '〇',
+        '〡',
+        '⺀',
+        '𠀀',
+        '𮯰',
         'あ',
         'ん',
         'ア',
@@ -1627,9 +1679,14 @@ mod tests {
             r"a++",
             r"[[:alpha:]]",
             r"[a&&b]",
+            r"[\p{L}&&\p{Han}]",
+            r"[\p{L}&&[^a]]",
+            r"[\p{L}&&[^\p{Han}]a]",
+            r"[&&[^\p{Han}]]",
+            r"[\p{L}&&[^]]",
             r"\d+",
             r"(?=a)",
-            r"\p{Han}",
+            r"\p{Hiragana}",
             r"a{3,1}",
             r"[z-a]",
             r"(?:ab)+",
@@ -1652,6 +1709,45 @@ mod tests {
             r"(?i:fi|fl|ff)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// The `Han` property and a class with it taken out agree with the
+    /// engine character by character: the whole Basic Multilingual Plane,
+    /// every ideograph range above it, and a stride over the rest, for the
+    /// property alone, negated, taken out of the Kimi template's two letter
+    /// classes, and taken out under an outer negation.
+    #[test]
+    fn han_and_the_classes_it_is_taken_out_of_agree_with_the_engine() {
+        let patterns = [
+            r"\p{Han}",
+            r"[^\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\p{L}\p{N}&&[^\p{Han}]]",
+            r"[a-z\p{M}&&[^\p{Han}\p{Lo}]]",
+        ];
+        let codes = (0u32..0x1_0000)
+            .chain(
+                unicode::HAN
+                    .iter()
+                    .flat_map(|&(start, end)| start.max(0x1_0000)..=end),
+            )
+            .chain((0x1_0000..=0x10_FFFF).step_by(97));
+        let mut buf = String::new();
+        for pattern in patterns {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let engine = SysRegex::new(pattern).expect("the engine compiles the pattern");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = engine.find_iter(&buf).next() == Some((0, buf.len()));
+                assert_eq!(ours, theirs, "{pattern} at U+{code:04X}");
+            }
         }
     }
 
