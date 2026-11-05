@@ -428,6 +428,12 @@ impl PreparedMeshServer {
     }
 }
 
+/// The status a table entry carries, for the log lines (an unknown value
+/// reads as `Init`).
+pub(crate) fn status_of(entry: &NodeState) -> NodeStatus {
+    NodeStatus::try_from(entry.status).unwrap_or(NodeStatus::Init)
+}
+
 /// Broadcast node state updates to target nodes, each dialed through
 /// `dialer` (the channel the probes keep to it, with the node's TLS identity
 /// when the mesh has one), in `sender`'s name (the broadcasting node's).

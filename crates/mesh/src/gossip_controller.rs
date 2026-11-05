@@ -54,7 +54,7 @@ use super::{
             gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, Ping, PingReq,
             StateSync, StreamMessage,
         },
-        ClusterState,
+        status_of, ClusterState,
     },
 };
 use crate::{
@@ -139,7 +139,7 @@ impl GossipController {
         let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
 
         loop {
-            log::info!("Round {} Status:{:?}", round, self.state.read());
+            log::trace!("Round {} Status:{:?}", round, self.state.read());
             self.reap_finished_streams().await;
             let targets = self.probe_targets();
             let peer = self.peer_to_dial(&targets);
@@ -155,7 +155,7 @@ impl GossipController {
 
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
                     let Some(peer) = peer else {
-                        log::info!("No peer address available to connect");
+                        log::debug!("No peer address available to connect");
                         continue;
                     };
                     let outcome = Self::dial_with_backoff(
@@ -167,7 +167,7 @@ impl GossipController {
                     .await;
                     match outcome {
                         DialOutcome::Connected => {
-                            log::info!("Successfully connected to peer {}", peer.name);
+                            log::debug!("Successfully connected to peer {}", peer.name);
                         }
                         DialOutcome::JoinPeerAlone { next_delay } => {
                             log::debug!(
@@ -343,7 +343,7 @@ impl GossipController {
     }
 
     async fn connect_to_peer(&self, peer: NodeState) -> Result<()> {
-        log::info!("Connecting to peer {} at {}", peer.name, peer.address);
+        log::debug!("Connecting to peer {} at {}", peer.name, peer.address);
 
         let read_state = self.state.clone();
 
@@ -365,13 +365,14 @@ impl GossipController {
             .await
         {
             Ok(node_update) => {
-                log::info!("Received NodeUpdate from peer: {:?}", node_update);
+                log::debug!("Received NodeUpdate from peer: {:?}", node_update);
                 // Update state for Alive or Leaving status
                 if node_update.status == NodeStatus::Alive as i32
                     || node_update.status == NodeStatus::Leaving as i32
                 {
                     let updated_peer = {
                         let mut s = read_state.write();
+                        let held = s.get(&node_update.name).map(status_of);
                         let entry = s
                             .entry(node_update.name.clone())
                             .and_modify(|e| {
@@ -399,7 +400,20 @@ impl GossipController {
                                 version: 1,
                                 metadata: HashMap::new(),
                             });
-                        entry.clone()
+                        let entry = entry.clone();
+                        if held != Some(status_of(&entry)) {
+                            log::info!(
+                                "Member {} is {:?} at version {} (its answer to a probe; was {})",
+                                entry.name,
+                                status_of(&entry),
+                                entry.version,
+                                held.map_or_else(
+                                    || "not in the table".to_string(),
+                                    |status| format!("{status:?}")
+                                )
+                            );
+                        }
+                        entry
                     }; // Lock is released here
 
                     // If node is Alive, establish sync_stream connection with freshest address.
@@ -419,7 +433,7 @@ impl GossipController {
                 }
             }
             Err(e) => {
-                log::info!("Failed to connect to peer: {}, now try ping-req", e);
+                log::warn!("Failed to connect to peer: {}, now try ping-req", e);
                 let mut map = read_state.read().clone();
                 map.retain(|k, v| {
                     k.ne(&self.self_name)
@@ -429,7 +443,7 @@ impl GossipController {
                 let random_nodes = get_random_values_refs(&map, 3);
                 let mut reachable = false;
                 for node in random_nodes {
-                    log::info!(
+                    log::debug!(
                         "Trying to ping-req node {}, req target: {}",
                         node.address,
                         peer_addr
@@ -500,7 +514,7 @@ impl GossipController {
             }
         }
 
-        log::info!("Successfully connected to peer {}", peer_addr);
+        log::debug!("Successfully connected to peer {}", peer_addr);
 
         Ok(())
     }
@@ -623,7 +637,7 @@ impl GossipController {
                                 round_elapsed,
                             );
                             if round_elapsed.as_millis() > 10 {
-                                log::info!(
+                                log::debug!(
                                     peer = %peer_name_incremental,
                                     round_ms = round_elapsed.as_millis(),
                                     "mesh sync round"
@@ -705,7 +719,7 @@ impl GossipController {
         } else {
             format!("http://{peer_addr}")
         };
-        log::info!("Connecting to URL: {}", connect_url);
+        log::debug!("Connecting to URL: {}", connect_url);
 
         let mut endpoint = Endpoint::from_shared(connect_url.clone())
             .map_err(|e| anyhow::anyhow!("Invalid peer endpoint {connect_url}: {e}"))?;

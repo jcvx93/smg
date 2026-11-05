@@ -56,7 +56,7 @@ use super::{
             gossip_server::{Gossip, GossipServer},
             GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
         },
-        ClusterState,
+        status_of, ClusterState,
     },
     transport::{
         limits::MAX_MESSAGE_SIZE,
@@ -262,10 +262,26 @@ impl GossipService {
             }
             match state.get_mut(&node.name) {
                 None => {
+                    log::info!(
+                        "Member {} is {:?} at version {} (joined this node's table)",
+                        node.name,
+                        status_of(&node),
+                        node.version
+                    );
                     state.insert(node.name.clone(), node);
                     updated = true;
                 }
                 Some(entry) if node.version > entry.version => {
+                    if node.status != entry.status {
+                        log::info!(
+                            "Member {} is {:?} at version {} ({}; was {:?})",
+                            node.name,
+                            status_of(&node),
+                            node.version,
+                            table_source(sender, &self.self_name),
+                            status_of(entry)
+                        );
+                    }
                     *entry = node;
                     updated = true;
                 }
@@ -276,11 +292,11 @@ impl GossipService {
                             || node.status == NodeStatus::Leaving as i32) =>
                 {
                     log::info!(
-                        "Member {} speaks: {:?} at version {} by its own word (held {:?} at version {})",
+                        "Member {} is {:?} at version {} (its own word; was {:?} at version {})",
                         node.name,
-                        NodeStatus::try_from(node.status).unwrap_or(NodeStatus::Init),
+                        status_of(&node),
                         entry.version + 1,
-                        NodeStatus::try_from(entry.status).unwrap_or(NodeStatus::Init),
+                        status_of(entry),
                         entry.version
                     );
                     entry.status = node.status;
@@ -311,9 +327,9 @@ impl Gossip for GossipService {
         let message = request.into_inner();
         match message.payload {
             Some(gossip::gossip_message::Payload::Ping(ping)) => {
-                log::info!("Received {:?}", ping);
+                log::trace!("Received {:?}", ping);
                 if let Some(stat_sync) = ping.state_sync {
-                    log::info!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
+                    log::debug!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
                     self.merge_state(stat_sync.nodes, &ping.sender);
                 }
                 // Return current status of self node (could be Alive or Leaving)
@@ -331,7 +347,7 @@ impl Gossip for GossipService {
                 }))
             }
             Some(gossip::gossip_message::Payload::PingReq(PingReq { node: Some(node) })) => {
-                log::info!("PingReq to node {} addr:{}", node.name, node.address);
+                log::debug!("PingReq to node {} addr:{}", node.name, node.address);
                 let res = self.dialer.ping(&node, None).await?;
                 Ok(Response::new(res))
             }
@@ -492,6 +508,20 @@ impl Gossip for GossipService {
     }
 }
 
+/// The source of a table that changed a member's status here, for the
+/// transition line: this node's own verdict (a status broadcast reaches its
+/// sender too), the named member's probe or broadcast, or a probe that
+/// names nobody (a member on an older build).
+fn table_source(sender: &str, self_name: &str) -> String {
+    if sender == self_name {
+        "this node's verdict".to_string()
+    } else if sender.is_empty() {
+        "a peer's table".to_string()
+    } else {
+        format!("{sender}'s table")
+    }
+}
+
 /// A peer's entry for this node merged into this node's own, `own`: a
 /// verdict other than `Alive` at or above the own version is refuted, the
 /// own entry set `Alive` one above the verdict's version (a late answer to a
@@ -516,7 +546,7 @@ fn refute_or_adopt(own: &mut NodeState, incoming: &NodeState) -> bool {
     }
     log::info!(
         "Refuting {:?} at version {} on this node: alive at version {}",
-        NodeStatus::try_from(incoming.status).unwrap_or(NodeStatus::Init),
+        status_of(incoming),
         incoming.version,
         incoming.version + 1
     );
