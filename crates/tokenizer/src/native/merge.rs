@@ -54,6 +54,16 @@ const EMPTY_KEY: u64 = u64::MAX;
 /// No neighbour, in the linked list of a long piece.
 const NONE: u32 = u32::MAX;
 
+/// Which tokens stand for the bytes a byte-level piece starts from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ByteTokens {
+    /// GPT-2's alphabet: a character per byte.
+    Alphabet,
+    /// Sentencepiece's `<0xHH>` tokens (a piece of such a vocabulary starts
+    /// from character symbols instead, see [`MergeTable::merge_symbols`]).
+    Hex,
+}
+
 /// The merges of one byte-level BPE model; see the module documentation.
 pub(super) struct MergeTable {
     /// The id of each byte's token.
@@ -81,9 +91,10 @@ pub(super) struct MergeTable {
 struct SerializedMerges<'a>(#[serde(borrow)] Vec<(Cow<'a, str>, Cow<'a, str>)>);
 
 impl MergeTable {
-    /// The table of `model`'s merges, or why the model's own merge stays in
-    /// place for the path's misses.
-    pub(super) fn from_model(model: &ModelWrapper) -> Result<Self, Declined> {
+    /// The table of `model`'s merges, with `tokens` as the spelling of its
+    /// byte tokens, or why the model's own merge stays in place for the
+    /// path's misses.
+    pub(super) fn from_model(model: &ModelWrapper, tokens: ByteTokens) -> Result<Self, Declined> {
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -100,8 +111,12 @@ impl MergeTable {
         let mut byte_ids = [0u32; 256];
         let mut utf8 = [0u8; 4];
         for (byte, alphabet) in super::bytes_char().into_iter().enumerate() {
+            let spelling = match tokens {
+                ByteTokens::Alphabet => Cow::Borrowed(&*alphabet.encode_utf8(&mut utf8)),
+                ByteTokens::Hex => Cow::Owned(format!("<0x{byte:02X}>")),
+            };
             byte_ids[byte] = model
-                .token_to_id(alphabet.encode_utf8(&mut utf8))
+                .token_to_id(&spelling)
                 .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
         }
         // The merges alone, through the model's `Serialize` (see `serialized`):
@@ -161,6 +176,12 @@ impl MergeTable {
             + size_of_val(&*self.keys)
             + size_of_val(&*self.ranks)
             + size_of_val(&*self.new_ids)
+    }
+
+    /// The id of `byte`'s token.
+    #[inline(always)]
+    pub(super) fn byte_id(&self, byte: u8) -> u32 {
+        self.byte_ids[usize::from(byte)]
     }
 
     /// Merges the table holds.
@@ -223,23 +244,38 @@ impl MergeTable {
     /// call, a hit pays nothing for the merge and a miss pays the call.
     #[inline(never)]
     pub(super) fn merge(&self, piece: &[u8], ids: &mut Vec<u32>) {
+        let symbols = piece.iter().map(|&byte| self.byte_ids[usize::from(byte)]);
         if piece.len() <= SHORT_PIECE_SYMBOLS {
-            self.merge_short(piece, ids);
+            self.merge_short(symbols, piece.len(), ids);
         } else {
-            self.merge_long(piece, ids);
+            self.merge_long(symbols, ids);
         }
     }
 
-    /// The merge of a short piece: the symbols and the ranks of the adjacent
+    /// Appends the ids `symbols` merge to under the table: initial symbols
+    /// of any kind, a character's token or a byte's, as the model's
+    /// `merge_word` makes them for a vocabulary with byte fallback (see
+    /// `sentencepiece`).
+    #[inline(never)]
+    pub(super) fn merge_symbols(&self, symbols: &[u32], ids: &mut Vec<u32>) {
+        if symbols.len() <= SHORT_PIECE_SYMBOLS {
+            self.merge_short(symbols.iter().copied(), symbols.len(), ids);
+        } else {
+            self.merge_long(symbols.iter().copied(), ids);
+        }
+    }
+
+    /// The merge of a short piece (`n` initial symbols, at most
+    /// [`SHORT_PIECE_SYMBOLS`]): the symbols and the ranks of the adjacent
     /// pairs on stack arrays, each round a scan for the least rank (the
     /// leftmost of equal ranks, which can only be the same pair twice), the
     /// two pairs the merged symbol forms recomputed.
-    fn merge_short(&self, piece: &[u8], ids: &mut Vec<u32>) {
+    fn merge_short(&self, initial: impl Iterator<Item = u32>, n: usize, ids: &mut Vec<u32>) {
         let mut symbols = [0u32; SHORT_PIECE_SYMBOLS];
         let mut ranks = [NO_RANK; SHORT_PIECE_SYMBOLS - 1];
-        let mut len = piece.len();
-        for (symbol, &byte) in symbols.iter_mut().zip(piece) {
-            *symbol = self.byte_ids[usize::from(byte)];
+        let mut len = n;
+        for (symbol, id) in symbols.iter_mut().zip(initial) {
+            *symbol = id;
         }
         for (rank, pair) in ranks.iter_mut().zip(symbols[..len].windows(2)) {
             *rank = self.rank_of(pair[0], pair[1]);
@@ -276,13 +312,12 @@ impl MergeTable {
     /// taken only when the pair at its position is still the pair it was
     /// pushed for (the rank names the pair; the model compares the token
     /// the pair produces, which comes to the same, see the module docs).
-    fn merge_long(&self, piece: &[u8], ids: &mut Vec<u32>) {
-        let last = piece.len() - 1;
-        let mut symbols: Vec<Symbol> = piece
-            .iter()
+    fn merge_long(&self, initial: impl ExactSizeIterator<Item = u32>, ids: &mut Vec<u32>) {
+        let last = initial.len() - 1;
+        let mut symbols: Vec<Symbol> = initial
             .enumerate()
-            .map(|(i, &byte)| Symbol {
-                id: self.byte_ids[usize::from(byte)],
+            .map(|(i, id)| Symbol {
+                id,
                 prev: if i == 0 { NONE } else { i as u32 - 1 },
                 next: if i == last { NONE } else { i as u32 + 1 },
             })
