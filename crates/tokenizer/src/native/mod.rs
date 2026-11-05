@@ -494,8 +494,9 @@ pub(crate) struct NativeEncoder {
     merges: Option<MergeTable>,
     /// The tables of the sentencepiece path, for a vocabulary with byte
     /// fallback (see [`sentencepiece`]): the stages are empty and `merges`
-    /// is `None` then, the pieces come from character symbols.
-    chars: Option<CharSymbols>,
+    /// is `None` then, the pieces come from character symbols. Boxed, so
+    /// the byte-level encoder keeps the layout it had.
+    chars: Option<Box<CharSymbols>>,
     /// Each thread's cache from piece bytes to ids. The encoder owns them, so
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
@@ -648,7 +649,7 @@ impl NativeEncoder {
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
             merges: None,
-            chars: Some(chars),
+            chars: Some(Box::new(chars)),
             piece_cache: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
