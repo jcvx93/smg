@@ -174,8 +174,11 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
 /// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
 /// token-work, prefill/generation throughput and hit rate that vLLM's stats do not
 /// carry, each rank's own: the servicer picks the rank a request goes to
-/// and sees what that rank cached and streamed for it.
-pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
+/// and sees what that rank cached and streamed for it. The rank the request
+/// names (`dp_rank`) is answered alone, every rank without one, as the
+/// other wires answer it; a rank this servicer does not serve answers no
+/// entry.
+pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     let ready = client.ready_response();
     let max_running_requests = state.shared.running_window(state.model.max_num_seqs);
@@ -191,7 +194,7 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         client.get_loads().loads,
         max_total_num_tokens,
         ranks,
-        None,
+        dp_rank,
         |load, figures| {
             let estimate = state
                 .shared

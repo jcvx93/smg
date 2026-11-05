@@ -205,7 +205,8 @@ impl std::fmt::Debug for VllmServicerConfig {
 /// attaches to every batch it streams.
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let response = info::loads(self).ok()?;
+        // Every rank's entry; the one asked for is picked below.
+        let response = info::loads(self, None).ok()?;
         let load = match dp_rank {
             // A connected rank reads its own entry (zero-filled until its
             // first scheduler step, whichever rank reported first), never
