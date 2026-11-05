@@ -10,7 +10,9 @@
 //! but not sampled. One JSON summary on stdout at the end (`--out` writes it
 //! too); `STRESS_INTERIM {...}` counters on stderr every `--interim` seconds.
 //!
-//! Modes (`--mode`): `chat` (chat completions; `--stream` for SSE), `tools`
+//! Modes (`--mode`): `chat` (chat completions; `--stream` for SSE),
+//! `completion` (`POST /v1/completions` with the prompt as its `prompt`;
+//! `--stream` for SSE), `tools`
 //! (a tool-heavy conversation: `--turns` tool-call rounds over `--tools`
 //! function schemas), `responses` (the Responses API with `store: true`,
 //! `--chain` requests per session linked by `previous_response_id`) and
@@ -74,6 +76,8 @@ static VOCAB: LazyLock<Vec<&'static str>> =
 enum Mode {
     /// `POST /v1/chat/completions` with one user message.
     Chat,
+    /// `POST /v1/completions` with the prompt as its `prompt`.
+    Completion,
     /// Chat completions with `--tools` function schemas and `--turns`
     /// rounds of assistant tool calls and tool results before the question.
     Tools,
@@ -95,7 +99,7 @@ enum Mode {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate)"
+    about = "Open-loop load client for the gateway stress bed (chat, completion, tools, responses, image, messages, embeddings, generate)"
 )]
 struct Args {
     /// Gateway base URL.
@@ -402,6 +406,13 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
                 }
                 body
             }
+            Mode::Completion => json!({
+                "model": args.model,
+                "prompt": prompt(args, i),
+                "max_tokens": args.max_tokens,
+                "stream": args.stream,
+                "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
+            }),
             Mode::Messages => json!({
                 "model": args.model,
                 "max_tokens": args.max_tokens,
@@ -1005,6 +1016,7 @@ fn interim_line(stats: &Stats, t: f64) -> String {
 async fn run(args: Args) -> Result<Summary> {
     let path = match args.mode {
         Mode::Responses => "/v1/responses",
+        Mode::Completion => "/v1/completions",
         Mode::Messages => "/v1/messages",
         Mode::Embeddings => "/v1/embeddings",
         Mode::Generate => "/generate",
@@ -1193,6 +1205,16 @@ mod tests {
         assert!(v["text"].as_str().unwrap().contains("[session 2]"));
         assert_eq!(v["sampling_params"]["max_new_tokens"], 8);
         assert_eq!(v["stream"], true);
+        assert!(v.get("messages").is_none());
+
+        let mut p = args(Mode::Completion);
+        p.stream = true;
+        let p = build_bodies(&p).unwrap();
+        let v: Value = serde_json::from_slice(&p[3]).unwrap();
+        assert!(v["prompt"].as_str().unwrap().contains("[session 3]"));
+        assert_eq!(v["max_tokens"], 8);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream_options"]["include_usage"], true);
         assert!(v.get("messages").is_none());
 
         let mut c = args(Mode::Chat);

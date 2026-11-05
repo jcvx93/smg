@@ -68,7 +68,7 @@ admin queue) and served by the wire with no engine time: the numbers are the gat
 | `json` | chat with `response_format: json_schema` | a JSON object | 500/s |
 | `messages` | `POST /v1/messages`, `max_tokens` 8 | 8 tokens | 500/s |
 
-Three streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
+Four streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
 per second near the `stream` path's):
 
 | path | request | answer | rate |
@@ -76,6 +76,7 @@ per second near the `stream` path's):
 | `messages_stream` | `POST /v1/messages`, `stream: true`, `max_tokens` 300 | 300 tokens, one per event, `length` | 100/s |
 | `generate_stream` | `POST /generate`, `stream: true`, `max_new_tokens` 300 | 300 tokens, one per frame, the whole text so far in every frame, `length` | 100/s |
 | `generate_stream_long` | the same, `max_new_tokens` 2000 | 2,000 tokens, one per frame | 16/s |
+| `completion_stream` | `POST /v1/completions`, `stream: true`, `max_tokens` 128 | 128 tokens, one per frame, `length` | 250/s |
 
 The long path's cells are long at the Makefile's default `PERF_REQUESTS` (10,000 requests at
 16/s is 625 s per cell, twice that at `--rate-scale 0.5`): pass a smaller count when naming it,
