@@ -5217,3 +5217,6 @@ impl<'a> MessagesStream<'a> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) mod bench;
