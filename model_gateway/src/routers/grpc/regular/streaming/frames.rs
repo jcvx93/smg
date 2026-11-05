@@ -54,11 +54,12 @@ pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 /// The SSE frame of the per-token chat chunks of one stream.
 ///
 /// Every chunk of a stream repeats the same `id`, `object`, `created`,
-/// `model` and `system_fingerprint`; only its choice and usage differ. The
-/// head up to and including `"choices":[` is serialized once per stream and
-/// copied in front of each chunk, so a chunk costs the serialization of its
-/// choice and usage only. The bytes are exactly those of a serialized
-/// [`super::ChatChunkWithUsage`] (the chunk-level `usage: null` placeholder included).
+/// `model`, `service_tier` and `system_fingerprint`; only its choice and
+/// usage differ. The head up to and including `"choices":[` is serialized
+/// once per stream and copied in front of each chunk, so a chunk costs the
+/// serialization of its choice and usage only. The bytes are exactly those
+/// of a serialized [`super::ChatChunkWithUsage`] (the chunk-level
+/// `usage: null` placeholder included).
 pub(super) struct ChatChunkFrame {
     head: Vec<u8>,
 }
@@ -70,7 +71,9 @@ impl ChatChunkFrame {
         created: u64,
         system_fingerprint: Option<&str>,
     ) -> Self {
-        let mut head = Vec::with_capacity(192);
+        // The id, the model, the created stamp, the service tier and a
+        // fingerprint fit without a second allocation.
+        let mut head = Vec::with_capacity(224);
         head.extend_from_slice(b"data: {\"id\":");
         push_json(&mut head, request_id);
         head.extend_from_slice(b",\"object\":\"chat.completion.chunk\",\"created\":");
