@@ -240,6 +240,7 @@ impl ChatCompletionStreamResponseBuilder {
             object: self.object,
             created: self.created,
             model: self.model,
+            service_tier: DEFAULT_SERVICE_TIER.to_string(),
             system_fingerprint: self.system_fingerprint,
             choices: self.choices,
             usage: self.usage,
