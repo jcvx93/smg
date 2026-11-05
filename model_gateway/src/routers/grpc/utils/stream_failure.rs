@@ -227,6 +227,18 @@ pub(crate) enum StreamFailure {
     Panicked(Panicked),
 }
 
+/// The per-choice state at the engine's `index` (the unit's own index on the
+/// completion stream), or the decoding failure an index past the choices the
+/// request expects is: the chat and completion streams report it alike.
+pub(crate) fn choice_mut<T>(choices: &mut [T], index: u32) -> Result<&mut T, StreamFailure> {
+    let expected = choices.len();
+    choices.get_mut(index as usize).ok_or_else(|| {
+        StreamFailure::from(format!(
+            "engine sent choice index {index}; the request expects {expected} choice(s)"
+        ))
+    })
+}
+
 impl StreamFailure {
     /// The engine's answer stream ended with `status` after `completion_tokens`.
     pub(crate) fn upstream(status: tonic::Status, completion_tokens: u32) -> Self {
