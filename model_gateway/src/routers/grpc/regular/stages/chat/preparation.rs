@@ -97,6 +97,12 @@ pub(crate) async fn prepare_chat_like(
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
+        utils::validate_logit_bias_token_ids(
+            request.logit_bias.as_ref(),
+            tokenizer.as_ref(),
+            || utils::reported_embedding_rows(&ctx.components.worker_registry, &ctx.input.model_id),
+        )
+        .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
 
         // Step 1: the request whose tools the template renders (every tool
         // for a named tool_choice; the constraint built below forces the call;

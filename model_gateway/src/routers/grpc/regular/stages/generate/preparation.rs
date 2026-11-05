@@ -12,7 +12,7 @@ use crate::{
         error,
         grpc::{
             context::{PreparationOutput, RequestContext},
-            utils,
+            utils::{self, UnknownTokenId},
         },
     },
     worker::WorkerRegistry,
@@ -107,7 +107,7 @@ impl GeneratePreparationStage {
                         .collect::<Result<Vec<u32>, _>>()
                         .map_err(|_| "input_ids must be non-negative".to_string())?;
                     reject_unknown_token_id(tokenizer.as_ref(), &converted, || {
-                        reported_embedding_rows(worker_registry, model_id)
+                        utils::reported_embedding_rows(worker_registry, model_id)
                     })?;
                     Ok((None, converted))
                 }
@@ -133,81 +133,18 @@ impl GeneratePreparationStage {
     }
 }
 
-/// The worker label that carries the engine's embedding-table size: `vocab_size` of the
-/// engine's model info, kept on every worker that reports it.
-const VOCAB_SIZE_LABEL: &str = "vocab_size";
-
-/// The embedding-table size the model's workers report, the smallest among those that report
-/// one (an id valid on a larger table is not on a smaller); `None` when no worker reports it.
-/// Read only after an id the tokenizer does not know, so a valid prompt never pays for it.
-fn reported_embedding_rows(worker_registry: &WorkerRegistry, model_id: &str) -> Option<usize> {
-    worker_registry
-        .get_by_model(model_id)
-        .iter()
-        .filter_map(|worker| {
-            worker
-                .metadata()
-                .spec
-                .labels
-                .get(VOCAB_SIZE_LABEL)
-                .and_then(|rows| rows.parse::<usize>().ok())
-        })
-        .min()
-}
-
 /// Refuses the first id that can reach no row of the engine's embedding table, naming its
-/// position, its value and the bound it missed.
-///
-/// An id below the tokenizer's base vocabulary is known by its range alone; one above it is an
-/// added token (the special tokens live there) and is resolved by lookup, so the common id costs
-/// one comparison and only the rare one a map read. The engines index their embeddings by these
-/// ids and the headless lanes run none of the checks an engine's own HTTP front end would, so an
-/// id past the table must not leave the gateway: on the engine it is an out-of-range index, not a
-/// refused request. The table is padded past the tokenizer's last id on most models and an
-/// engine samples over the padded logits, so an id the tokenizer does not know is judged by the
-/// table size the model's workers report (`embedding_rows`, read once, only then): below it the
-/// id passes, as it would on the engine. When no worker reports a table the tokenizer's ids are
-/// the bound, the one case where the gateway is stricter than the engine; a tokenizer that
-/// reports no vocabulary either skips the bound rather than refusing every pretokenized prompt.
+/// position, its value and the bound it missed; the rule is `utils::first_unknown_token_id`,
+/// shared with the `logit_bias` keys.
 fn reject_unknown_token_id(
     tokenizer: &dyn Tokenizer,
     ids: &[u32],
     embedding_rows: impl FnOnce() -> Option<usize>,
 ) -> Result<(), String> {
-    let base_vocab = tokenizer.vocab_size();
-    let known = |id: u32| {
-        usize::try_from(id).is_ok_and(|id| id < base_vocab) || tokenizer.id_to_token(id).is_some()
-    };
-    let first_unknown = if base_vocab == 0 {
-        // Without a vocabulary every id would be a lookup: the table alone judges them.
-        0
-    } else {
-        match ids.iter().position(|&id| !known(id)) {
-            None => return Ok(()),
-            Some(index) => index,
-        }
-    };
-    match embedding_rows() {
-        Some(rows) => {
-            let inside = |id: u32| usize::try_from(id).is_ok_and(|id| id < rows);
-            match ids[first_unknown..]
-                .iter()
-                .position(|&id| !inside(id) && !known(id))
-            {
-                None => Ok(()),
-                Some(offset) => Err(format!(
-                    "input_ids[{}] = {} is not a token of this model: its embedding table holds \
-                     {rows} rows",
-                    first_unknown + offset,
-                    ids[first_unknown + offset]
-                )),
-            }
-        }
-        None if base_vocab == 0 => Ok(()),
-        None => Err(format!(
-            "input_ids[{first_unknown}] = {} is not a token of this model: its vocabulary holds \
-             {base_vocab} tokens plus its added tokens",
-            ids[first_unknown]
+    match utils::first_unknown_token_id(tokenizer, ids, embedding_rows) {
+        None => Ok(()),
+        Some(UnknownTokenId { index, id, bound }) => Err(format!(
+            "input_ids[{index}] = {id} is not a token of this model: {bound}"
         )),
     }
 }

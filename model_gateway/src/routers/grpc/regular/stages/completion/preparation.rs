@@ -29,6 +29,12 @@ impl PipelineStage for CompletionPreparationStage {
 
         let tokenizer =
             utils::resolve_tokenizer(ctx, "CompletionPreparationStage::execute").map_err(|e| *e)?;
+        utils::validate_logit_bias_token_ids(
+            request.logit_bias.as_ref(),
+            tokenizer.as_ref(),
+            || utils::reported_embedding_rows(&ctx.components.worker_registry, &ctx.input.model_id),
+        )
+        .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
 
         let prompts: Vec<String> = match &request.prompt {
             StringOrArray::String(text) => vec![text.clone()],

@@ -36,7 +36,10 @@ use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::prepared_tools::prepare_tools;
+use super::{
+    prepared_tools::prepare_tools,
+    vocabulary::{first_unknown_token_id, UnknownTokenId},
+};
 use crate::{
     middleware::ReportedRefusal,
     observability::log_throttle::KeyedLogThrottle,
@@ -518,6 +521,30 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Refuses a `logit_bias` key that is no token of the model, judged as a
+/// pretokenized prompt's ids are (`first_unknown_token_id`: the tokenizer's
+/// vocabulary, its added tokens, then the embedding table the model's workers
+/// report). Request validation proved the keys non-negative integers; the
+/// engines' own front ends check them against the model, and the gateway's
+/// engine connections bypass those front ends, so an unchecked id would reach
+/// the sampler as an out-of-range index.
+pub(crate) fn validate_logit_bias_token_ids(
+    logit_bias: Option<&HashMap<String, f32>>,
+    tokenizer: &dyn Tokenizer,
+    embedding_rows: impl FnOnce() -> Option<usize>,
+) -> Result<(), String> {
+    let Some(bias) = logit_bias.filter(|bias| !bias.is_empty()) else {
+        return Ok(());
+    };
+    let ids: Vec<u32> = bias.keys().filter_map(|key| key.parse().ok()).collect();
+    match first_unknown_token_id(tokenizer, &ids, embedding_rows) {
+        None => Ok(()),
+        Some(UnknownTokenId { id, bound, .. }) => Err(format!(
+            "Invalid key in 'logit_bias': '{id}' is not a token of this model: {bound}"
+        )),
+    }
 }
 
 /// The content the engine's chat utils hand a template for a message without

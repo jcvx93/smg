@@ -11,6 +11,7 @@ mod pd_bootstrap;
 mod prepared_tools;
 pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
+mod vocabulary;
 
 // Re-export all public items so consumer imports stay unchanged.
 pub use aliases::{answering_to, ALIASES, UNANSWERED};
@@ -19,7 +20,7 @@ pub(crate) use chat_utils::{
     filter_chat_request_by_tool_choice, filter_tools_by_tool_choice, generate_tool_call_id,
     keep_first_tool_call, keep_first_tool_call_items, missing_tokenizer_response,
     parse_finish_reason, parse_json_schema_response, process_chat_messages_with_placeholders,
-    resolve_tokenizer, send_error_sse, validate_chat_content_parts,
+    resolve_tokenizer, send_error_sse, validate_chat_content_parts, validate_logit_bias_token_ids,
 };
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,
@@ -50,6 +51,7 @@ pub(crate) use parsers::{
 };
 pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
+pub(crate) use vocabulary::{first_unknown_token_id, reported_embedding_rows, UnknownTokenId};
 
 /// One WARN per choice whose stream recovered from a rewritten decode prefix
 /// (see `smg_detokenize_prefix_mismatch_total`): the client got the text as

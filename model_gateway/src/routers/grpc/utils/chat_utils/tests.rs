@@ -56,6 +56,38 @@ fn unknown_chat_content_parts_are_rejected_in_every_role() {
     }
 }
 
+/// A `logit_bias` key at or beyond the vocabulary is refused before any
+/// engine wire; the last token id, an empty map and no map pass.
+#[test]
+fn logit_bias_keys_are_judged_as_a_pretokenized_prompts_ids_are() {
+    let tokenizer = llm_tokenizer::MockTokenizer::new().with_tokens(&[("<|added|>", 50_000)]);
+    let base = tokenizer.vocab_size() as u32;
+    let bias = |id: u32| Some(HashMap::from([(id.to_string(), -100.0f32)]));
+    let no_table = || -> Option<usize> { panic!("the table is read only after an unknown id") };
+    // A key inside the base vocabulary, or an added token above it, passes without a table read.
+    assert!(validate_logit_bias_token_ids(bias(base - 1).as_ref(), &tokenizer, no_table).is_ok());
+    assert!(validate_logit_bias_token_ids(bias(50_000).as_ref(), &tokenizer, no_table).is_ok());
+    // A key the tokenizer does not know is refused when no worker reports a table...
+    let unknown = base + 7;
+    let error =
+        validate_logit_bias_token_ids(bias(unknown).as_ref(), &tokenizer, || None).unwrap_err();
+    assert!(
+        error.starts_with(&format!("Invalid key in 'logit_bias': '{unknown}' ")),
+        "{error}"
+    );
+    assert!(error.contains(&format!("holds {base} tokens")), "{error}");
+    // ...passes inside the table the workers report, and is refused past it naming the table.
+    assert!(
+        validate_logit_bias_token_ids(bias(unknown).as_ref(), &tokenizer, || Some(2_000)).is_ok()
+    );
+    let error = validate_logit_bias_token_ids(bias(2_000).as_ref(), &tokenizer, || Some(2_000))
+        .unwrap_err();
+    assert!(error.contains("embedding table holds 2000 rows"), "{error}");
+    // Nothing to judge without a map.
+    assert!(validate_logit_bias_token_ids(Some(&HashMap::new()), &tokenizer, no_table).is_ok());
+    assert!(validate_logit_bias_token_ids(None, &tokenizer, no_table).is_ok());
+}
+
 #[test]
 fn process_chat_messages_rejects_unknown_content_parts() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
