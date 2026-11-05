@@ -18,7 +18,8 @@ use common::counting_alloc::{calls, Counting};
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
     traits::{Encoder, PromptEncoding, Tokenizer},
-    CacheConfig, CachedTokenizer, HuggingFaceTokenizer, Sequence, TiktokenTokenizer,
+    CacheConfig, CachedTokenizer, HuggingFaceTokenizer, Sequence, StopRules, StopSequenceConfig,
+    StopSequenceDecoder, TiktokenTokenizer,
 };
 use tokenizers::{
     decoders::{
@@ -323,5 +324,67 @@ fn a_segmented_render_of_forty_turns_encodes_its_ids_into_one_buffer() {
          segment count (about 760), a tighter or looser sizing rule by the regrowths it saves \
          or adds, and a change of the library by what its encodes make",
         ids.token_ids().len()
+    );
+}
+
+/// A request's stop rules: four stop strings and two stop token ids, as an
+/// agent's request carries them.
+fn stop_config() -> StopSequenceConfig {
+    StopSequenceConfig::default()
+        .with_stop_sequence("\n\nHuman:")
+        .with_stop_sequence("</s>")
+        .with_stop_sequence("###")
+        .with_stop_sequence("Observation:")
+        .with_stop_token(2)
+        .with_stop_token(50_256)
+}
+
+/// A request's stop rules are built once and copied into each of its choices'
+/// decoders: the copy allocates the stop strings and their list (five calls for
+/// four strings; none without strings), nothing of the automaton, which shares
+/// its tables, nor of the ids, which live inline; a decoder over the copy
+/// allocates that and its own decode state, where one built from the request's
+/// parameters pays the automaton's build and the ids' sort again.
+#[test]
+fn a_choices_stop_decoder_copies_the_requests_rules_instead_of_building_them() {
+    let tokenizer = byte_level();
+    let (rules, build) = allocations_during(|| StopRules::new(stop_config()));
+    let (_, copying) = allocations_during(|| rules.clone());
+    assert_eq!(
+        copying, 5,
+        "a copy of the rules of four stop strings allocated {copying} times: the strings and \
+         their list, nothing of the automaton or the ids"
+    );
+    assert!(
+        build > copying,
+        "the build allocated {build} times and the copy {copying}: the automaton's build and the \
+         ids' sort are paid once"
+    );
+    let (none, no_copy) = allocations_during(|| StopRules::new(StopSequenceConfig::default()));
+    let (_, copying_none) = allocations_during(|| none.clone());
+    assert_eq!(
+        (no_copy, copying_none),
+        (0, 0),
+        "the rules of no stops allocate nothing to build ({no_copy}) and nothing to copy \
+         ({copying_none})"
+    );
+    let (_, state_only) =
+        allocations_during(|| StopSequenceDecoder::with_rules(Arc::clone(&tokenizer), none, false));
+    let (_, from_copy) = allocations_during(|| {
+        StopSequenceDecoder::with_rules(Arc::clone(&tokenizer), rules.clone(), false)
+    });
+    let (_, from_config) = allocations_during(|| {
+        StopSequenceDecoder::new(Arc::clone(&tokenizer), stop_config(), false)
+    });
+    assert_eq!(
+        from_copy,
+        state_only + copying,
+        "a decoder over a copy of the rules allocated {from_copy} times: the copy ({copying}) and \
+         its own decode state ({state_only})"
+    );
+    assert!(
+        from_config > from_copy,
+        "a decoder built from the request's parameters allocated {from_config} times, one over a \
+         copy of its rules {from_copy}"
     );
 }
