@@ -159,7 +159,8 @@ pub(crate) fn convert_harmony_logprobs(
     proto_logprobs: ProtoOutputLogProbs<'_>,
 ) -> ChatLogProbs {
     let tokenizer = encoding.tokenizer();
-    utils::convert_proto_logprobs(proto_logprobs, |token_id| {
+    // Every candidate the engine sent, as this path always answered.
+    utils::convert_proto_logprobs(proto_logprobs, None, |token_id| {
         tokenizer
             .decode_utf8([token_id])
             .unwrap_or_else(|_| format!("<token_{token_id}>"))
